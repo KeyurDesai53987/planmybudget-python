@@ -3,7 +3,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import get_settings
 from app.database import init_db
-from app.routers import auth, accounts, categories, transactions, budgets, goals, recurring, reminders, profile, health, dashboard
+from app.routers import auth, accounts, categories, transactions, budgets, goals, recurring, reminders, profile, health, dashboard, import_data
 
 settings = get_settings()
 
@@ -38,3 +38,4 @@ app.include_router(reminders.router)
 app.include_router(profile.router)
 app.include_router(health.router)
 app.include_router(dashboard.router)
+app.include_router(import_data.router)
