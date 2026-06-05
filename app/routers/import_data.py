@@ -1,6 +1,8 @@
 import csv
 import io
 import re
+from typing import Optional
+from pydantic import BaseModel
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -17,9 +19,38 @@ except ImportError:
 router = APIRouter()
 
 
+def detect_delimiter(content: str) -> str:
+    try:
+        dialect = csv.Sniffer().sniff(content[:1024])
+        return dialect.delimiter
+    except csv.Error:
+        pass
+    first_line = content.split('\n')[0].strip()
+    comma_count = first_line.count(',')
+    semicolon_count = first_line.count(';')
+    tab_count = first_line.count('\t')
+    if semicolon_count > comma_count and semicolon_count > tab_count:
+        return ';'
+    if tab_count > comma_count and tab_count > semicolon_count:
+        return '\t'
+    return ','
+
+
 def parse_csv(content: str) -> list[dict]:
-    reader = csv.DictReader(io.StringIO(content))
-    return [{k.strip(): v.strip() for k, v in row.items() if k} for row in reader]
+    delimiter = detect_delimiter(content)
+    reader = csv.DictReader(io.StringIO(content), delimiter=delimiter)
+    rows = []
+    for row in reader:
+        cleaned = {}
+        for k, v in row.items():
+            if k is None:
+                continue
+            key = k.strip()
+            if key:
+                cleaned[key] = v.strip() if v else ''
+        if cleaned:
+            rows.append(cleaned)
+    return rows
 
 
 def parse_excel(content: bytes) -> list[dict]:
@@ -136,6 +167,13 @@ def parse_row(row: dict, mapping: dict, category_map: dict) -> dict:
 @router.post("/api/transactions/import/preview")
 async def preview_import(
     file: UploadFile = File(...),
+    dateColumn: str = Form(""),
+    descriptionColumn: str = Form(""),
+    amountColumn: str = Form(""),
+    typeColumn: str = Form(""),
+    categoryColumn: str = Form(""),
+    debitColumn: str = Form(""),
+    creditColumn: str = Form(""),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -160,7 +198,16 @@ async def preview_import(
         raise HTTPException(status_code=400, detail="File has no data rows")
 
     headers = list(rows[0].keys())
-    mapping = auto_detect_mapping(headers)
+    auto = auto_detect_mapping(headers)
+    mapping = {
+        "date": dateColumn or auto.get("date", ""),
+        "description": descriptionColumn or auto.get("description", ""),
+        "amount": amountColumn or auto.get("amount", ""),
+        "type": typeColumn or auto.get("type", ""),
+        "category": categoryColumn or auto.get("category", ""),
+        "debit": debitColumn or auto.get("debit", ""),
+        "credit": creditColumn or auto.get("credit", ""),
+    }
 
     result = await db.execute(select(Category).where(Category.userId == user.id))
     categories = result.scalars().all()
@@ -171,7 +218,7 @@ async def preview_import(
 
     preview_rows = []
     errors = []
-    for i, row in enumerate(rows[:20]):
+    for i, row in enumerate(rows[:100]):
         parsed = parse_row(row, mapping, category_map)
         row_errors = []
         if not parsed["date"]:
@@ -293,4 +340,64 @@ async def import_transactions(
         "errors": errors,
         "total": len(rows),
         "account_id": accountId,
+    }
+
+
+class ImportRow(BaseModel):
+    date: str
+    description: str = ""
+    amount: float = 0
+    type: str = "debit"
+    categoryId: Optional[str] = None
+
+
+class ImportRowsRequest(BaseModel):
+    accountId: str
+    rows: list[ImportRow]
+
+
+@router.post("/api/transactions/import/rows")
+async def import_transactions_rows(
+    body: ImportRowsRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(Account).where(Account.id == body.accountId, Account.userid == user.id))
+    account = result.scalar_one_or_none()
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    created = 0
+    errors = []
+    for i, row in enumerate(body.rows):
+        if not row.date:
+            errors.append({"row": i + 1, "error": "Missing date"})
+            continue
+
+        amount = row.amount
+        if row.type == "debit":
+            amount = -abs(amount)
+        else:
+            amount = abs(amount)
+
+        txn = Transaction(
+            accountId=body.accountId,
+            categoryId=row.categoryId or None,
+            date=row.date,
+            amount=amount,
+            type=row.type,
+            description=row.description or None,
+        )
+        db.add(txn)
+        account.balance = (account.balance or 0) + amount
+        created += 1
+
+    if created > 0:
+        await db.commit()
+
+    return {
+        "imported": created,
+        "errors": errors,
+        "total": len(body.rows),
+        "account_id": body.accountId,
     }
