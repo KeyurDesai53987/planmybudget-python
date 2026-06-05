@@ -19,26 +19,42 @@ except ImportError:
 router = APIRouter()
 
 
-def detect_delimiter(content: str) -> str:
+def detect_dialect(content: str) -> dict:
     try:
-        dialect = csv.Sniffer().sniff(content[:1024])
-        return dialect.delimiter
+        dialect = csv.Sniffer().sniff(content[:2048])
+        return {'delimiter': dialect.delimiter, 'quotechar': dialect.quotechar, 'escapechar': dialect.escapechar, 'doublequote': dialect.doublequote}
     except csv.Error:
         pass
     first_line = content.split('\n')[0].strip()
     comma_count = first_line.count(',')
     semicolon_count = first_line.count(';')
     tab_count = first_line.count('\t')
+    delim = ','
     if semicolon_count > comma_count and semicolon_count > tab_count:
-        return ';'
-    if tab_count > comma_count and tab_count > semicolon_count:
-        return '\t'
-    return ','
+        delim = ';'
+    elif tab_count > comma_count and tab_count > semicolon_count:
+        delim = '\t'
+    return {'delimiter': delim, 'quotechar': '"', 'escapechar': None, 'doublequote': True}
+
+
+def try_decode(content: bytes) -> str:
+    for enc in ('utf-8-sig', 'utf-8', 'latin-1', 'cp1252', 'iso-8859-1'):
+        try:
+            return content.decode(enc)
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+    return content.decode('utf-8', errors='replace')
 
 
 def parse_csv(content: str) -> list[dict]:
-    delimiter = detect_delimiter(content)
-    reader = csv.DictReader(io.StringIO(content), delimiter=delimiter)
+    dialect = detect_dialect(content)
+    reader = csv.DictReader(
+        io.StringIO(content),
+        delimiter=dialect['delimiter'],
+        quotechar=dialect['quotechar'],
+        escapechar=dialect['escapechar'],
+        doublequote=dialect['doublequote'],
+    )
     rows = []
     for row in reader:
         cleaned = {}
@@ -48,7 +64,7 @@ def parse_csv(content: str) -> list[dict]:
             key = k.strip()
             if key:
                 cleaned[key] = v.strip() if v else ''
-        if cleaned:
+        if cleaned and any(cleaned.values()):
             rows.append(cleaned)
     return rows
 
@@ -182,7 +198,7 @@ async def preview_import(
 
     if filename.endswith(".csv"):
         try:
-            decoded = content.decode("utf-8-sig")
+            decoded = try_decode(content)
             rows = parse_csv(decoded)
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Failed to parse CSV: {str(e)}")
@@ -218,7 +234,7 @@ async def preview_import(
 
     preview_rows = []
     errors = []
-    for i, row in enumerate(rows[:100]):
+    for i, row in enumerate(rows[:200]):
         parsed = parse_row(row, mapping, category_map)
         row_errors = []
         if not parsed["date"]:
@@ -269,25 +285,25 @@ async def import_transactions(
 
     if filename.endswith(".csv"):
         try:
-            decoded = content.decode("utf-8-sig")
+            decoded = try_decode(content)
             rows = parse_csv(decoded)
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Failed to parse CSV: {str(e)}")
-    elif filename.endswith((".xls", ".xlsx")):
-        try:
-            rows = parse_excel(content)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Failed to parse Excel: {str(e)}")
-    else:
-        raise HTTPException(status_code=400, detail="Unsupported format")
 
     if not rows:
-        raise HTTPException(status_code=400, detail="No data rows found")
+        raise HTTPException(status_code=400, detail="File has no data rows")
 
-    result = await db.execute(select(Account).where(Account.id == accountId, Account.userid == user.id))
-    account = result.scalar_one_or_none()
-    if not account:
-        raise HTTPException(status_code=404, detail="Account not found")
+    headers = list(rows[0].keys())
+    auto = auto_detect_mapping(headers)
+    mapping = {
+        "date": dateColumn or auto.get("date", ""),
+        "description": descriptionColumn or auto.get("description", ""),
+        "amount": amountColumn or auto.get("amount", ""),
+        "type": typeColumn or auto.get("type", ""),
+        "category": categoryColumn or auto.get("category", ""),
+        "debit": debitColumn or auto.get("debit", ""),
+        "credit": creditColumn or auto.get("credit", ""),
+    }
 
     result = await db.execute(select(Category).where(Category.userId == user.id))
     categories = result.scalars().all()
